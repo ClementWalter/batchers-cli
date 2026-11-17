@@ -7,7 +7,8 @@ description: >-
   batch age (policy and pinned), next dispatch time in UTC, the previous
   batch's state, the owner, and what the batch waits on (paused, previous
   batch in flight, age, or due). `batcher` shows one batcher with its last
-  batches. Read-only. Every read supports --json. Triggers - "batcher status",
+  batches. Read-only. Every read supports --json, and `schedule` and `batcher`
+  a --pretty table. Triggers - "batcher status",
   "when does this vault dispatch", "next dispatch", "redeem batchers
   schedule", "is a batch in flight", "which batchers are paused", "warm-up
   batchers", "batchers cli".
@@ -58,6 +59,10 @@ user's GitHub login. Configure it once in `~/.config/batchers-cli/config.json`
 - `--json`: normalized records: ISO UTC times, seconds, batch state names,
   `waiting` as `paused | previous-batch | age | due`.
 - `--raw` (`schedule` only): the decoded getter results per batcher.
+- `--pretty`: for a human at a terminal: a table per vault (`schedule`) or
+  per batcher with its batches (`batcher`), coloured `waiting` and state, short
+  addresses linked to Etherscan. Not for agents: it costs more and hides full
+  addresses.
 - Logs and RPC retries go to stderr; `--debug` for more.
 
 ## Commands
@@ -69,6 +74,8 @@ batchers schedule                                 # every batcher, soonest dispa
 batchers schedule --vault curator-usdc --vault curator-usdt
 batchers schedule --side redeem --waiting previous-batch
 batchers schedule --limit 5 --json
+batchers schedule --vault curator-usdc --pretty         # tables for a human
+batchers batcher curator-usdc/redeem-0 --history 10 --pretty
 batchers batcher curator-usdc/redeem-2               # REF: <vault>/<side> or an address
 batchers batcher curator-usdt/deposit curator-usdt/redeem-0 --history 5 --json
 batchers --network sepolia schedule

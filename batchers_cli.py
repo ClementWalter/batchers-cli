@@ -7,6 +7,7 @@
 #     "eth-abi==5.2.0",
 #     "eth-utils==5.3.1",
 #     "pycryptodome==3.23.0",
+#     "rich==15.0.0",
 # ]
 #
 # [tool.uv]
@@ -32,6 +33,7 @@ Output conventions:
 - default: one line per batcher, the batcher address tab-separated last
 - --json:  normalized records (UTC ISO times, seconds, state names)
 - --raw:   the decoded call results per batcher (debugging only)
+- --pretty: a table per vault for a human at a terminal
 """
 
 from __future__ import annotations
@@ -51,6 +53,10 @@ import click
 import requests
 from eth_abi import decode, encode
 from eth_utils import function_signature_to_4byte_selector, is_address, to_checksum_address
+from rich.cells import cell_len
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 log = logging.getLogger("batchers-cli")
 
@@ -71,6 +77,10 @@ TIMEOUT_SECONDS = 20
 RETRIES = 3
 # publicnode answers 429 to bursts of 100-call batches; 40 passes.
 CALLS_PER_REQUEST = 40
+# Block explorer per chain id, for --pretty links.
+EXPLORERS = {1: "https://etherscan.io", 11155111: "https://sepolia.etherscan.io"}
+WAITING_STYLES = {"due": "green", "age": "", "previous-batch": "yellow", "paused": "red"}
+STATE_STYLES = {"Pending": "cyan", "Dispatched": "yellow", "Finalized": "green", "Canceled": "dim"}
 # OZ BatcherConfidential.BatchState, in declaration order.
 BATCH_STATES = ("Pending", "Dispatched", "Finalized", "Canceled")
 
@@ -374,10 +384,17 @@ def short_time(value: str | None) -> str:
     return f"{value[:10]} {value[11:16]} UTC" if value else "-"
 
 
+def seconds_until(value: str | None, now: int) -> int | None:
+    """Seconds from `now` to an ISO UTC time; negative once it has passed."""
+    if not value:
+        return None
+    return int(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()) - now
+
+
 def format_line(record: dict[str, Any], now: int) -> str:
     """The compact one-line view; the full batcher address is tab-separated last."""
     next_at = record["nextDispatchAt"]
-    eta = int(datetime.strptime(next_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()) - now if next_at else None
+    eta = seconds_until(next_at, now)
     owner = record["ownerLabel"] or record["owner"]
     previous = (
         f"prev #{record['previousBatchId']} {record['previousState']} {short_time(record['previousDispatchedAt'])}"
@@ -394,6 +411,99 @@ def format_line(record: dict[str, Any], now: int) -> str:
         f"owner {owner}",
     ]
     return "  ".join(parts) + f"\t{record['address']}"
+
+
+def side_order(side: str) -> tuple[int, int]:
+    """deposit first, then redeem-0, redeem-1, … in rotation order."""
+    return (0, 0) if side == "deposit" else (1, int(side.rsplit("-", 1)[-1]) if side[-1].isdigit() else 0)
+
+
+def linked(address: str | None, chain_id: int | None, label: str | None = None) -> str:
+    """`label` or a short address, linked to its explorer page when the chain has one."""
+    if not address:
+        return "-"
+    text = label or f"{address[:6]}…{address[-4:]}"
+    base = EXPLORERS.get(chain_id or 0)
+    return f"[link={base}/address/{address}]{text}[/link]" if base else text
+
+
+def styled(value: str | None, styles: dict[str, str]) -> str:
+    """`value` in its style, or `-`."""
+    if not value:
+        return "-"
+    style = styles.get(value, "")
+    return f"[{style}]{value}[/]" if style else value
+
+
+def table_of(title: str, columns: list[str], rows: list[list[str]], right: set[str]) -> Table:
+    """A table whose columns are never narrower than their longest cell.
+
+    Below that width the terminal soft-wraps lines instead of Rich truncating cells.
+    """
+    table = Table(title=title, title_justify="left", header_style="bold")
+    for index, column in enumerate(columns):
+        width = max(cell_len(Text.from_markup(cell).plain) for cell in [column, *(row[index] for row in rows)])
+        table.add_column(column, no_wrap=True, min_width=width, justify="right" if column in right else "left")
+    for row in rows:
+        table.add_row(*row)
+    return table
+
+
+def render_schedule(records: list[dict[str, Any]], chain_id: int | None, now: int, console: Console | None = None) -> None:
+    """One table per vault, its batchers in rotation order."""
+    console = console or Console()
+    console.print(f"[dim]now {short_time(iso(now))}[/dim]")
+    by_vault: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_vault.setdefault(record["vault"], []).append(record)
+    for vault, group in sorted(by_vault.items()):
+        rows = []
+        for r in sorted(group, key=lambda r: side_order(r["side"])):
+            previous = (
+                f"#{r['previousBatchId']} {styled(r['previousState'], STATE_STYLES)}" if r["previousBatchId"] else "-"
+            )
+            age = duration(r["batchMinBatchAge"])
+            rows.append([
+                r["side"],
+                f"#{r['batchId']}",
+                styled(r["waiting"], WAITING_STYLES),
+                short_time(r["nextDispatchAt"]).removesuffix(" UTC"),
+                relative(seconds_until(r["nextDispatchAt"], now)),
+                age,
+                age if r["minBatchAge"] == r["batchMinBatchAge"] else f"[yellow]{duration(r['minBatchAge'])}[/yellow]",
+                previous,
+                linked(r["owner"], chain_id, r["ownerLabel"]),
+                linked(r["address"], chain_id),
+            ])
+        columns = ["Side", "Batch", "Waiting", "Next (UTC)", "When", "Age", "Policy", "Previous", "Owner", "Batcher"]
+        table = table_of(f"[bold]{vault}[/bold]", columns, rows, {"Batch", "Age", "Policy"})
+        console.print(table, crop=False)
+        console.print()
+
+
+def render_batchers(records: list[dict[str, Any]], chain_id: int | None, now: int, console: Console | None = None) -> None:
+    """One table per batcher: its schedule line as the title, its last batches as rows."""
+    console = console or Console()
+    for r in records:
+        title = (
+            f"[bold]{r['vault']} {r['side']}[/bold] · {linked(r['address'], chain_id, r['address'])} · "
+            f"waiting {styled(r['waiting'], WAITING_STYLES)} · next {short_time(r['nextDispatchAt'])} "
+            f"({relative(seconds_until(r['nextDispatchAt'], now))}) · owner {linked(r['owner'], chain_id, r['ownerLabel'])}"
+        )
+        rows = []
+        for b in r["batches"]:
+            rows.append([
+                f"#{b['id']}",
+                styled(b["state"], STATE_STYLES),
+                short_time(b["createdAt"]).removesuffix(" UTC"),
+                duration(b["minBatchAge"]),
+                short_time(b["dispatchedAt"]).removesuffix(" UTC"),
+                duration(b["callbackDeadline"]),
+            ])
+        columns = ["Batch", "State", "Created (UTC)", "Age", "Dispatched (UTC)", "Callback deadline"]
+        console.print(title)
+        console.print(table_of("", columns, rows, {"Batch", "Age", "Callback deadline"}), crop=False)
+        console.print()
 
 
 def emit_json(value: Any) -> None:
@@ -458,6 +568,7 @@ def vaults(ctx: click.Context, as_json: bool) -> None:
     "  batchers schedule\n"
     "  batchers schedule --vault curator-usdc --vault curator-usdt\n"
     "  batchers schedule --side redeem --waiting previous-batch\n"
+    "  batchers schedule --pretty\n"
     "  batchers schedule --json | jq '.[] | select(.waiting == \"due\")'"
 )
 @click.option("--vault", "slugs", multiple=True, help="Vault slug. Repeatable. Default: every vault.")
@@ -470,9 +581,17 @@ def vaults(ctx: click.Context, as_json: bool) -> None:
 @click.option("--limit", type=int, default=0, help="Show at most N batchers, soonest dispatch first. 0: all.")
 @click.option("--json", "as_json", is_flag=True, help="Normalized records.")
 @click.option("--raw", is_flag=True, help="Decoded call results per batcher (debugging).")
+@click.option("--pretty", is_flag=True, help="A table per vault for a human: colours, linked short addresses.")
 @click.pass_context
 def schedule(
-    ctx: click.Context, slugs: tuple[str, ...], side: str | None, waiting: str | None, limit: int, as_json: bool, raw: bool
+    ctx: click.Context,
+    slugs: tuple[str, ...],
+    side: str | None,
+    waiting: str | None,
+    limit: int,
+    as_json: bool,
+    raw: bool,
+    pretty: bool,
 ) -> None:
     """Each batcher's current batch, when it can dispatch, and what it waits on."""
     book, rpc = network_context(ctx)
@@ -495,6 +614,9 @@ def schedule(
         records = records[:limit]
     if as_json:
         emit_json(records)
+        return
+    if pretty:
+        render_schedule(records, book.get("chainId"), now)
         return
     click.echo(f"now {short_time(iso(now))}  network {ctx.obj['network']}")
     for record in records:
@@ -519,14 +641,16 @@ def resolve_ref(ref: str, entries: list[dict[str, str]]) -> dict[str, str]:
 @cli.command(
     epilog="\b\nExamples:\n"
     "  batchers batcher curator-usdc/redeem-2\n"
+    "  batchers batcher curator-usdc/redeem-2 --history 10 --pretty\n"
     "  batchers batcher curator-usdt/deposit curator-usdt/redeem-0 --history 5 --json\n"
     "  batchers batcher 0x0000000000000000000000000000000000001234"
 )
 @click.argument("refs", nargs=-1, required=True)
 @click.option("--history", type=int, default=3, show_default=True, help="Batches to show, newest first.")
 @click.option("--json", "as_json", is_flag=True, help="Normalized records.")
+@click.option("--pretty", is_flag=True, help="A table per batcher for a human: its last batches, colours, links.")
 @click.pass_context
-def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bool) -> None:
+def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bool, pretty: bool) -> None:
     """One or more batchers in full, with their last batches. REF: address or <vault>/<side>."""
     book, rpc = network_context(ctx)
     entries = [resolve_ref(ref, batchers_of(book)) for ref in refs]
@@ -552,6 +676,9 @@ def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bo
         records.append(record)
     if as_json:
         emit_json(records)
+        return
+    if pretty:
+        render_batchers(records, book.get("chainId"), now)
         return
     for record in records:
         click.echo(format_line(record, now))

@@ -42,6 +42,7 @@ RPC defaults to a public node; set `"rpc": {"mainnet": "<url>"}` for another.
 
 ```bash
 batchers schedule
+batchers schedule --pretty
 batchers schedule --vault <slug> --side redeem
 batchers batcher <slug>/redeem-0 --history 5
 batchers schedule --json | jq .

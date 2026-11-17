@@ -7,6 +7,7 @@
 #     "eth-abi==5.2.0",
 #     "eth-utils==5.3.1",
 #     "pycryptodome==3.23.0",
+#     "rich==15.0.0",
 #     "pytest==8.4.2",
 # ]
 #
@@ -208,6 +209,21 @@ def test_missing_address_book_names_the_config(monkeypatch):
     monkeypatch.delenv("BATCHERS_ADDRESS_BOOK", raising=False)
     result = CliRunner().invoke(bc.cli, ["vaults"])
     assert "--address-book" in result.output
+
+
+def test_schedule_pretty_titles_each_vault(book, chain):
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "schedule", "--pretty"])
+    assert "curator-usdc" in result.output
+
+
+def test_batcher_pretty_lists_its_batches(book, chain):
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "batcher", "curator-usdc/redeem-0", "--history", "2", "--pretty"])
+    assert "Dispatched" in result.output
+
+
+@pytest.mark.parametrize(("side", "order"), [("deposit", (0, 0)), ("redeem-10", (1, 10))])
+def test_side_order_puts_deposit_first(side, order):
+    assert bc.side_order(side) == order
 
 
 @pytest.mark.parametrize(("seconds", "text"), [(45, "45s"), (1800, "30m"), (86280, "23h58m"), (518400, "6d00h")])
