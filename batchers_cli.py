@@ -547,17 +547,27 @@ def cli(ctx: click.Context, network: str, address_book: str | None, rpc_url: str
 
 
 @cli.command(
-    epilog="\b\nExamples:\n  batchers vaults\n  batchers vaults --json\n  batchers --network sepolia vaults"
+    epilog="\b\nExamples:\n  batchers vaults\n  batchers vaults --json\n  batchers vaults --pretty\n  batchers --network sepolia vaults"
 )
 @click.option("--json", "as_json", is_flag=True, help="Normalized records.")
+@click.option("--pretty", is_flag=True, help="A table per vault for a human, addresses linked.")
 @click.pass_context
-def vaults(ctx: click.Context, as_json: bool) -> None:
+def vaults(ctx: click.Context, as_json: bool, pretty: bool) -> None:
     """Each vault in the address book with its batchers (no chain read)."""
     obj = ctx.obj
     book = load_address_book(resolve_source(obj["address_book"]), obj["network"])
     rows = batchers_of(book)
     if as_json:
         emit_json(rows)
+        return
+    if pretty:
+        console = Console()
+        by_vault: dict[str, list[list[str]]] = {}
+        for row in rows:
+            by_vault.setdefault(row["vault"], []).append([row["side"], linked(row["address"], book.get("chainId"), row["address"])])
+        for vault, group in by_vault.items():
+            console.print(table_of(f"[bold]{vault}[/bold]", ["Side", "Batcher"], group, set()), crop=False)
+            console.print()
         return
     for row in rows:
         click.echo(f"{row['vault']} {row['side']}\t{row['address']}")

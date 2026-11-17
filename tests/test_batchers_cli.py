@@ -204,6 +204,12 @@ def test_vaults_reads_no_chain(book, monkeypatch):
     assert [r["side"] for r in json.loads(result.output)] == ["deposit", "redeem-0", "redeem-1"]
 
 
+def test_vaults_pretty_prints_full_addresses(book, monkeypatch):
+    monkeypatch.setenv("BATCHERS_CLI_CONFIG", "/nonexistent")
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "vaults", "--pretty"])
+    assert REDEEM_1 in result.output
+
+
 def test_missing_address_book_names_the_config(monkeypatch):
     monkeypatch.setenv("BATCHERS_CLI_CONFIG", "/nonexistent")
     monkeypatch.delenv("BATCHERS_ADDRESS_BOOK", raising=False)
