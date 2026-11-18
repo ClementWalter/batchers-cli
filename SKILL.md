@@ -5,13 +5,14 @@ description: >-
   bundled `batchers` command. For every vault in an address book it lists the
   deposit batcher and each redeem batcher of the rotation: current batch, min
   batch age (policy and pinned), next dispatch time in UTC, the previous
-  batch's state and the amount it unshielded, the owner, and what the batch
+  batch's state, depositors and the amount it unshielded, the owner, and what the batch
   waits on (paused, previous batch in flight, age, or due). `batcher` shows
-  one batcher with its last batches and what each unshielded. Read-only. Every read supports --json, and `schedule` and `batcher`
+  one batcher with its last batches, their depositors and what each unshielded. Read-only. Every read supports --json, and `schedule` and `batcher`
   a --pretty table. Triggers - "batcher status",
   "when does this vault dispatch", "next dispatch", "redeem batchers
   schedule", "is a batch in flight", "which batchers are paused", "warm-up
-  batchers", "how much did this batch unshield", "batchers cli".
+  batchers", "how much did this batch unshield", "how many depositors",
+  "batchers cli".
 allowed-tools:
   - Bash
   - Read
@@ -64,6 +65,9 @@ user's GitHub login. Configure it once in `~/.config/batchers-cli/config.json`
   unwrap is not finalized, `"?"` only when the node refused the logs (pruned
   history). `unshieldedToken` names the unit: `{address, symbol, decimals,
   priceUsd}`. Rate-limited calls are retried, never reported missing.
+- Depositors: `depositors` (current batch, so far) and `previousDepositors`
+  (`schedule`), `batches[].depositors` (`batcher`); an integer, `"?"` when
+  the node refused the logs.
 - Text and `--pretty` print amounts as `1,602,071.31 USDT ($1,600,382.17)`:
   thousands separators, cents above one token, up to 6 decimals below.
 - `--raw` (`schedule` only): the decoded getter results per batcher.
@@ -120,6 +124,11 @@ batchers --network sepolia schedule
   wrapper's `UnwrapFinalized` log for the batch's `unwrapRequestId`, so it
   appears once the unwrap is finalized, which can precede the route
   (`Dispatched` with an amount). `0` is an empty batch.
+- `depositors` counts the distinct accounts in the batch at dispatch: its
+  `Joined` logs minus accounts that `quit` before its `BatchDispatched` log. A
+  `Quit` after dispatch is the refund of a canceled batch and does not count.
+  A join's amount is encrypted, so an account whose transfer failed (joined
+  0) still counts: a `Canceled` batch can show depositors and unshield 0.
 - The unit is the input wrapper's underlying: the asset (USDC, WBTC…) for a
   deposit batcher, the vault share (steakUSDT…) for a redeem one.
 - USD is at the **current** price, not the price at dispatch: DefiLlama's

@@ -23,7 +23,8 @@ previous batch's state and dispatch time.
 
 A dispatched batch unwraps its deposits; the input wrapper's `UnwrapFinalized`
 log, keyed by the batch's `unwrapRequestId`, carries the cleartext amount the
-batch unshielded. Nodes that prune logs leave older batches' amounts unknown.
+batch unshielded. The batcher's `Joined`/`Quit` logs before its `BatchDispatched`
+give the batch's depositors. Nodes that prune logs leave older batches' amounts unknown.
 The amount is shown in the wrapper's underlying token, and in USD at the current
 price: DefiLlama's price of the underlying, or for an ERC-4626 share its on-chain
 `convertToAssets` times DefiLlama's price of the asset.
@@ -92,6 +93,10 @@ STATE_STYLES = {"Pending": "cyan", "Dispatched": "yellow", "Finalized": "green",
 BATCH_STATES = ("Pending", "Dispatched", "Finalized", "Canceled")
 # IERC7984ERC20Wrapper.UnwrapFinalized(receiver, unwrapRequestId, encryptedAmount, cleartextAmount).
 UNWRAP_FINALIZED = "0x" + keccak(text="UnwrapFinalized(address,bytes32,bytes32,uint64)").hex()
+# BatcherConfidential: a deposit, a withdrawal while Pending (or refund once Canceled), and the dispatch.
+JOINED = "0x" + keccak(text="Joined(uint256,address,bytes32)").hex()
+QUIT = "0x" + keccak(text="Quit(uint256,address,bytes32)").hex()
+BATCH_DISPATCHED = "0x" + keccak(text="BatchDispatched(uint256)").hex()
 # Blocks per eth_getLogs; publicnode serves logs only for its last ~10k blocks.
 LOG_BLOCKS = 5000
 # DefiLlama's keyless current-price API, and its name for each chain id.
@@ -334,8 +339,8 @@ def decoded(raw: str | None, types: list[str]) -> Any:
     return "0x" + value.hex() if types == ["bytes32"] else value
 
 
-def read_batchers(rpc: Rpc, addresses: list[str], unshielded: bool = True) -> list[dict[str, Any]]:
-    """Each batcher's own fields, then its current and previous batch (with what they unshielded)."""
+def read_batchers(rpc: Rpc, addresses: list[str], with_logs: bool = True) -> list[dict[str, Any]]:
+    """Each batcher's own fields, then its current and previous batch (with their logged unshielded and depositors)."""
     calls = [(a, calldata(sig)) for a in addresses for _, sig, _ in BATCHER_CALLS]
     raw = rpc.call_many(calls)
     states = []
@@ -352,8 +357,8 @@ def read_batchers(rpc: Rpc, addresses: list[str], unshielded: bool = True) -> li
         for batch_id in (current, current - 1) if current > 1 else (current,):
             batch_reads.append((s["address"], batch_id))
     batches = read_batches(rpc, batch_reads)
-    if unshielded:
-        read_unshielded(rpc, batches, {s["address"]: s["fromToken"] for s in states})
+    if with_logs:
+        read_batch_logs(rpc, batches, {s["address"]: s["fromToken"] for s in states})
     for s in states:
         s["current"] = batches[(s["address"], s["currentBatchId"])]
         s["previous"] = batches.get((s["address"], s["currentBatchId"] - 1))
@@ -373,21 +378,26 @@ def read_batches(rpc: Rpc, reads: list[tuple[str, int]]) -> dict[tuple[str, int]
     return out
 
 
-def read_unshielded(rpc: Rpc, batches: dict[tuple[str, int], dict[str, Any]], from_tokens: dict[str, str | None]) -> None:
-    """Set each dispatched batch's `unshielded` cleartext from its input wrapper's `UnwrapFinalized` log.
+def read_batch_logs(rpc: Rpc, batches: dict[tuple[str, int], dict[str, Any]], from_tokens: dict[str, str | None]) -> None:
+    """Set each batch's `unshielded` and `depositors` from logs, in one `eth_getLogs` batch.
 
-    `unshielded` is None while the unwrap is not finalized, and `unshieldedUnknown` is True where the node
-    refused the logs the batch's unwrap could sit in.
+    - `unshielded`: the cleartext of the input wrapper's `UnwrapFinalized` log for the batch's `unwrapRequestId`;
+      None while the unwrap is not finalized.
+    - `depositors`: accounts in the batch, from its `Joined` and `Quit` logs up to its `BatchDispatched` log
+      (a later `Quit` is a refund of a canceled batch, not a leave).
+
+    `unshieldedUnknown` / `depositorsUnknown` are True where the node refused the logs the answer sits in.
     """
     for batch in batches.values():
-        batch["unshielded"], batch["unshieldedUnknown"] = None, False
-    wanted = [
-        (from_tokens.get(address), batch)
+        batch.update(unshielded=None, unshieldedUnknown=False, depositors=None, depositorsUnknown=False)
+    unwraps = [
+        (from_tokens[address], batch)
         for (address, _), batch in batches.items()
-        if batch.get("unwrapRequestId") and int(batch["unwrapRequestId"], 16) and batch.get("dispatchedAt")
+        if from_tokens.get(address) and batch.get("unwrapRequestId") and int(batch["unwrapRequestId"], 16)
+        and batch.get("dispatchedAt")
     ]
-    wanted = [(token, batch) for token, batch in wanted if token]
-    if not wanted:
+    joins = [(address, batch) for (address, _), batch in batches.items() if batch.get("createdAt")]
+    if not unwraps and not joins:
         return
     latest, latest_ts = rpc.latest_block()
 
@@ -395,35 +405,65 @@ def read_unshielded(rpc: Rpc, batches: dict[tuple[str, int], dict[str, Any]], fr
         # Missed slots only make the real block later, so this never starts past it.
         return max(0, latest - -(-(latest_ts - ts) // SECONDS_PER_BLOCK))
 
+    # (address, topics, first block) per query, chunked to LOG_BLOCKS up to latest.
+    queries: list[tuple[str, list[Any], int]] = []
     by_token: dict[str, list[dict[str, Any]]] = {}
-    for token, batch in wanted:
+    for token, batch in unwraps:
         by_token.setdefault(token, []).append(batch)
-    filters = []
     for token, group in by_token.items():
         ids = sorted({b["unwrapRequestId"] for b in group})
-        for start in range(min(block_at(b["dispatchedAt"]) for b in group), latest + 1, LOG_BLOCKS):
-            end = min(start + LOG_BLOCKS - 1, latest)
-            filters.append((token, start, end, {"address": token, "fromBlock": hex(start), "toBlock": hex(end),
-                                                "topics": [UNWRAP_FINALIZED, None, ids]}))
+        queries.append((token, [UNWRAP_FINALIZED, None, ids], min(block_at(b["dispatchedAt"]) for b in group)))
+    by_batcher: dict[str, list[dict[str, Any]]] = {}
+    for address, batch in joins:
+        by_batcher.setdefault(address, []).append(batch)
+    for address, group in by_batcher.items():
+        ids = ["0x" + encode(["uint256"], [b["id"]]).hex() for b in group]
+        queries.append((address, [[JOINED, QUIT, BATCH_DISPATCHED], ids], min(block_at(b["createdAt"]) for b in group)))
+    filters = [
+        (address, end, {"address": address, "fromBlock": hex(start), "toBlock": hex(end), "topics": topics})
+        for address, topics, first in queries
+        for start in range(first, latest + 1, LOG_BLOCKS)
+        for end in (min(start + LOG_BLOCKS - 1, latest),)
+    ]
     reasons: dict[int, str] = {}
     answers = rpc.batch("eth_getLogs", [[f] for *_, f in filters], reasons)
-    found: dict[tuple[str, str], int] = {}
+    logs: dict[str, list[dict[str, Any]]] = {}
     refused: dict[str, int] = {}
-    for (token, _, end, _), logs in zip(filters, answers, strict=True):
-        if logs is None:
-            refused[token] = max(refused.get(token, -1), end)
-            continue
-        for entry in logs:
-            # data = encryptedAmount (bytes32) ‖ cleartextAmount (uint64).
-            found[(token, entry["topics"][2].lower())] = int(entry["data"][-64:], 16)
-    for token, batch in wanted:
-        amount = found.get((token, batch["unwrapRequestId"].lower()))
-        batch["unshielded"] = amount
-        batch["unshieldedUnknown"] = amount is None and block_at(batch["dispatchedAt"]) <= refused.get(token, -1)
-    unknown = sum(b["unshieldedUnknown"] for _, b in wanted)
+    for (address, end, _), answer in zip(filters, answers, strict=True):
+        if answer is None:
+            refused[address] = max(refused.get(address, -1), end)
+        else:
+            logs.setdefault(address, []).extend(answer)
+
+    unwrapped = {
+        (token, entry["topics"][2].lower()): int(entry["data"][-64:], 16)  # data = encrypted ‖ cleartext uint64
+        for token in by_token
+        for entry in logs.get(token, [])
+    }
+    for token, batch in unwraps:
+        batch["unshielded"] = unwrapped.get((token, batch["unwrapRequestId"].lower()))
+        batch["unshieldedUnknown"] = batch["unshielded"] is None and block_at(batch["dispatchedAt"]) <= refused.get(token, -1)
+
+    for address, group in by_batcher.items():
+        events = sorted(logs.get(address, []), key=lambda e: (int(e["blockNumber"], 16), int(e["logIndex"], 16)))
+        for batch in group:
+            if block_at(batch["createdAt"]) <= refused.get(address, -1):
+                batch["depositorsUnknown"] = True
+                continue
+            members: set[str] = set()
+            for entry in events:
+                if int(entry["topics"][1], 16) != batch["id"]:
+                    continue
+                if entry["topics"][0] == BATCH_DISPATCHED:
+                    break
+                account = entry["topics"][2][-40:].lower()
+                (members.add if entry["topics"][0] == JOINED else members.discard)(account)
+            batch["depositors"] = len(members)
+
+    unknown = sum(b["unshieldedUnknown"] or b["depositorsUnknown"] for b in batches.values())
     if unknown:
         log.warning(
-            "the RPC refused logs (%s): %d batch(es) unshielded unknown; pass an archive --rpc-url",
+            "the RPC refused logs (%s): %d batch(es) partly unknown; pass an archive --rpc-url",
             next(iter(reasons.values()), "no reason"),
             unknown,
         )
@@ -548,6 +588,13 @@ def unshielded_of(batch: dict[str, Any] | None, token: dict[str, Any] | None) ->
     return "?" if batch.get("unshieldedUnknown") else amount(batch.get("unshielded"), token)
 
 
+def depositors_of(batch: dict[str, Any] | None) -> int | str | None:
+    """A batch's depositor count, `?` when the node refused its logs."""
+    if not batch:
+        return None
+    return "?" if batch.get("depositorsUnknown") else batch.get("depositors")
+
+
 def usd_of(whole: str | None, token: dict[str, Any] | None) -> float | None:
     """The USD value of `whole` underlying tokens at the current price, to the cent."""
     if whole in (None, "?") or not token or token.get("priceUsd") is None or token.get("decimals") is None:
@@ -568,6 +615,11 @@ def units(whole: str | None, token: dict[str, Any] | None) -> str:
         text = f"{value:,.6f}".rstrip("0").rstrip(".")
     symbol = (token or {}).get("symbol")
     return f"{text} {symbol}" if symbol else text
+
+
+def count(value: int | str | None) -> str:
+    """A count, `?` unknown, `-` none."""
+    return "-" if value is None else str(value)
 
 
 def dollars(value: float | None) -> str:
@@ -602,6 +654,8 @@ def normalize(
         "previousBatchId": previous["id"] if previous else None,
         "previousState": previous["state"] if previous else None,
         "previousDispatchedAt": iso(previous["dispatchedAt"]) if previous else None,
+        "depositors": depositors_of(current),
+        "previousDepositors": depositors_of(previous),
         "previousUnshielded": previous_unshielded,
         "previousUnshieldedUsd": usd_of(previous_unshielded, token),
         "previousUnshieldedRaw": previous.get("unshielded") if previous else None,
@@ -659,13 +713,14 @@ def format_line(record: dict[str, Any], now: int) -> str:
     owner = record["ownerLabel"] or record["owner"]
     previous = (
         f"prev #{record['previousBatchId']} {record['previousState']} {short_time(record['previousDispatchedAt'])}"
+        f" depositors {count(record['previousDepositors'])}"
         f" unshielded {unshielded_text(record['previousUnshielded'], record['previousUnshieldedUsd'], record['unshieldedToken'])}"
         if record["previousBatchId"]
         else "prev -"
     )
     parts = [
         f"{record['vault']} {record['side']}",
-        f"#{record['batchId']}",
+        f"#{record['batchId']} depositors {count(record['depositors'])}",
         f"age {duration(record['batchMinBatchAge'])} (policy {duration(record['minBatchAge'])})",
         f"next {short_time(next_at)} ({relative(eta)})",
         f"waiting {record['waiting']}",
@@ -728,19 +783,25 @@ def render_schedule(records: list[dict[str, Any]], chain_id: int | None, now: in
             rows.append([
                 r["side"],
                 f"#{r['batchId']}",
+                count(r["depositors"]),
                 styled(r["waiting"], WAITING_STYLES),
                 short_time(r["nextDispatchAt"]).removesuffix(" UTC"),
                 relative(seconds_until(r["nextDispatchAt"], now)),
                 age,
                 age if r["minBatchAge"] == r["batchMinBatchAge"] else f"[yellow]{duration(r['minBatchAge'])}[/yellow]",
                 previous,
+                count(r["previousDepositors"]),
                 units(r["previousUnshielded"], r["unshieldedToken"]),
                 dollars(r["previousUnshieldedUsd"]),
                 linked(r["owner"], chain_id, r["ownerLabel"]),
                 linked(r["address"], chain_id),
             ])
-        columns = ["Side", "Batch", "Waiting", "Next (UTC)", "When", "Age", "Policy", "Previous", "Unshielded", "USD", "Owner", "Batcher"]
-        table = table_of(f"[bold]{vault}[/bold]", columns, rows, {"Batch", "Age", "Policy", "Unshielded", "USD"})
+        columns = [
+            "Side", "Batch", "Depositors", "Waiting", "Next (UTC)", "When", "Age", "Policy",
+            "Previous", "Prev. depositors", "Unshielded", "USD", "Owner", "Batcher",
+        ]
+        right = {"Batch", "Depositors", "Age", "Policy", "Prev. depositors", "Unshielded", "USD"}
+        table = table_of(f"[bold]{vault}[/bold]", columns, rows, right)
         console.print(table, crop=False)
         console.print()
 
@@ -759,6 +820,7 @@ def render_batchers(records: list[dict[str, Any]], chain_id: int | None, now: in
             rows.append([
                 f"#{b['id']}",
                 styled(b["state"], STATE_STYLES),
+                count(b["depositors"]),
                 short_time(b["createdAt"]).removesuffix(" UTC"),
                 duration(b["minBatchAge"]),
                 short_time(b["dispatchedAt"]).removesuffix(" UTC"),
@@ -766,9 +828,10 @@ def render_batchers(records: list[dict[str, Any]], chain_id: int | None, now: in
                 units(b["unshielded"], r["unshieldedToken"]),
                 dollars(b["unshieldedUsd"]),
             ])
-        columns = ["Batch", "State", "Created (UTC)", "Age", "Dispatched (UTC)", "Callback deadline", "Unshielded", "USD"]
+        columns = ["Batch", "State", "Depositors", "Created (UTC)", "Age", "Dispatched (UTC)", "Callback deadline", "Unshielded", "USD"]
+        right = {"Batch", "Depositors", "Age", "Callback deadline", "Unshielded", "USD"}
         console.print(title)
-        console.print(table_of("", columns, rows, {"Batch", "Age", "Callback deadline", "Unshielded", "USD"}), crop=False)
+        console.print(table_of("", columns, rows, right), crop=False)
         console.print()
 
 
@@ -931,11 +994,12 @@ def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bo
     """One or more batchers in full, with their last batches. REF: address or <vault>/<side>."""
     book, rpc = network_context(ctx)
     entries = [resolve_ref(ref, batchers_of(book)) for ref in refs]
-    states = read_batchers(rpc, [e["address"] for e in entries], unshielded=False)
+    states = read_batchers(rpc, [e["address"] for e in entries], with_logs=False)
     reads = [(s["address"], b) for s in states for b in range(s["currentBatchId"], max(0, s["currentBatchId"] - history), -1)]
     batches = read_batches(rpc, reads)
-    read_unshielded(rpc, batches, {s["address"]: s["fromToken"] for s in states})
+    read_batch_logs(rpc, batches, {s["address"]: s["fromToken"] for s in states})
     for s in states:
+        s["current"] = batches[(s["address"], s["currentBatchId"])]
         if s["previous"]:
             s["previous"] = batches[(s["address"], s["previous"]["id"])]
     now = int(time.time())
@@ -954,6 +1018,7 @@ def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bo
                 "dispatchedAt": iso(b["dispatchedAt"]),
                 "callbackDeadline": b["callbackDeadline"],
                 "unwrapRequestId": b["unwrapRequestId"],
+                "depositors": depositors_of(b),
                 "unshielded": unshielded_of(b, token),
                 "unshieldedUsd": usd_of(unshielded_of(b, token), token),
                 "unshieldedRaw": b["unshielded"],
@@ -971,7 +1036,7 @@ def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bo
         click.echo(format_line(record, now))
         for b in record["batches"]:
             click.echo(
-                f"  #{b['id']} {b['state']}  created {short_time(b['createdAt'])}  age {duration(b['minBatchAge'])}"
+                f"  #{b['id']} {b['state']}  depositors {count(b['depositors'])}  created {short_time(b['createdAt'])}  age {duration(b['minBatchAge'])}"
                 f"  dispatched {short_time(b['dispatchedAt'])}  callback deadline {duration(b['callbackDeadline'])}"
                 f"  unshielded {unshielded_text(b['unshielded'], b['unshieldedUsd'], record['unshieldedToken'])}"
             )

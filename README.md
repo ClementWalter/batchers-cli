@@ -9,7 +9,7 @@ could set up).
 Read when each confidential vault batcher dispatches, from chain. For every
 vault in an address book, `batchers` lists the deposit batcher and each redeem
 batcher: current batch, min batch age, next dispatch time, the previous batch's
-state and the amount it unshielded, the owner, and what the batch waits on.
+state, depositors and the amount it unshielded, the owner, and what the batch waits on.
 Read-only.
 
 ## Install

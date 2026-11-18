@@ -55,6 +55,19 @@ LATEST_BLOCK = 1_000_000
 FINALIZED_UNWRAP = "0x" + "aa" * 32
 INFLIGHT_UNWRAP = "0x" + "bb" * 32
 UNWRAPPED = {FINALIZED_UNWRAP: 12_500_000}
+ALICE, BOB, CAROL = (f"0x{n:040x}" for n in (0xA11CE, 0xB0B, 0xCA401))
+# DEPOSIT's batch logs in chain order: (event, batch id, account).
+# Batch 4: Bob quits before dispatch (leaves), Carol after it (a refund; still a depositor).
+DEPOSIT_LOGS = [
+    ("Joined", 4, ALICE),
+    ("Joined", 4, BOB),
+    ("Joined", 4, CAROL),
+    ("Quit", 4, BOB),
+    ("BatchDispatched", 4, None),
+    ("Quit", 4, CAROL),
+    ("Joined", 5, ALICE),
+    ("Joined", 5, ALICE),
+]
 
 
 def selector(signature: str) -> str:
@@ -131,8 +144,25 @@ class StubResponse:
             raise bc.requests.HTTPError(str(self.status_code))
 
 
+def batcher_logs(query: dict) -> list[dict]:
+    """DEPOSIT's Joined/Quit/BatchDispatched logs matching `query`'s batch ids."""
+    topic = {"Joined": bc.JOINED, "Quit": bc.QUIT, "BatchDispatched": bc.BATCH_DISPATCHED}
+    ids = query["topics"][1]
+    out = []
+    for index, (event, batch_id, account) in enumerate(DEPOSIT_LOGS):
+        batch_topic = "0x" + encode(["uint256"], [batch_id]).hex()
+        if batch_topic in ids:
+            topics = [topic[event], batch_topic] + (["0x" + encode(["address"], [account]).hex()] if account else [])
+            out.append({"topics": topics, "data": "0x", "blockNumber": hex(LATEST_BLOCK), "logIndex": hex(index)})
+    return out
+
+
 def unwrap_logs(query: dict) -> list[dict]:
-    """The UnwrapFinalized logs of TOKEN matching `query`'s request ids."""
+    """The UnwrapFinalized logs of TOKEN matching `query`'s request ids, or DEPOSIT's batch logs."""
+    if query["address"].lower() == DEPOSIT:
+        return batcher_logs(query)
+    if query["address"].lower() != TOKEN:
+        return []
     ids = query["topics"][2]
     return [
         {"topics": [bc.UNWRAP_FINALIZED, "0x" + "00" * 32, rid], "data": "0x" + encode(["bytes32", "uint64"], [b"\0" * 32, value]).hex()}
@@ -325,6 +355,28 @@ def test_persistent_rate_limit_is_an_error(book, chain):
     chain.rate_limited = {"eth_getLogs": 1000}
     result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "schedule"])
     assert "rate-limited" in result.output
+
+
+def test_quit_before_dispatch_leaves_the_batch(book, chain):
+    assert by_side(schedule(book))["deposit"]["previousDepositors"] == 2
+
+
+def test_open_batch_counts_each_account_once(book, chain):
+    assert by_side(schedule(book))["deposit"]["depositors"] == 1
+
+
+def test_batch_without_joins_has_no_depositors(book, chain):
+    assert by_side(schedule(book))["redeem-0"]["depositors"] == 0
+
+
+def test_pruned_logs_leave_depositors_unknown(book, chain):
+    chain.pruned_before = LATEST_BLOCK
+    assert by_side(schedule(book))["deposit"]["previousDepositors"] == "?"
+
+
+def test_batcher_history_reports_each_batch_depositors(book, chain):
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "batcher", "curator-usdc/deposit", "--history", "2", "--json"])
+    assert [b["depositors"] for b in json.loads(result.output)[0]["batches"]] == [1, 2]
 
 
 def test_batcher_history_reports_each_batch_unshielded(book, chain):
