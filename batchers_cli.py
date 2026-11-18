@@ -24,6 +24,9 @@ previous batch's state and dispatch time.
 A dispatched batch unwraps its deposits; the input wrapper's `UnwrapFinalized`
 log, keyed by the batch's `unwrapRequestId`, carries the cleartext amount the
 batch unshielded. Nodes that prune logs leave older batches' amounts unknown.
+The amount is shown in the wrapper's underlying token, and in USD at the current
+price: DefiLlama's price of the underlying, or for an ERC-4626 share its on-chain
+`convertToAssets` times DefiLlama's price of the asset.
 
 A batcher dispatches its current batch once all of these hold:
 - it is not paused;
@@ -91,6 +94,9 @@ BATCH_STATES = ("Pending", "Dispatched", "Finalized", "Canceled")
 UNWRAP_FINALIZED = "0x" + keccak(text="UnwrapFinalized(address,bytes32,bytes32,uint64)").hex()
 # Blocks per eth_getLogs; publicnode serves logs only for its last ~10k blocks.
 LOG_BLOCKS = 5000
+# DefiLlama's keyless current-price API, and its name for each chain id.
+PRICES_URL = "https://coins.llama.fi/prices/current/{coins}"
+PRICE_CHAINS = {1: "ethereum"}
 # Post-merge slot time: a timestamp's block is at most this many seconds per block back.
 SECONDS_PER_BLOCK = 12
 
@@ -423,11 +429,83 @@ def read_unshielded(rpc: Rpc, batches: dict[tuple[str, int], dict[str, Any]], fr
         )
 
 
-def read_decimals(rpc: Rpc, tokens: list[str]) -> dict[str, int | None]:
-    """Each token's `decimals()`."""
-    unique = sorted(set(tokens))
-    raw = rpc.call_many([(t, calldata("decimals()")) for t in unique])
-    return {t: decoded(r, ["uint8"]) for t, r in zip(unique, raw, strict=True)}
+def read_fields(rpc: Rpc, calls: list[tuple[str, str, str, tuple[int, ...], list[str]]]) -> dict[tuple[str, str], Any]:
+    """{(address, field): value} for each (address, field, signature, args, types); a revert is None."""
+    raw = rpc.call_many([(address, calldata(sig, args)) for address, _, sig, args, _ in calls])
+    out = {}
+    for (address, field, _, _, types), r in zip(calls, raw, strict=True):
+        try:
+            out[(address, field)] = decoded(r, types)
+        except Exception:  # noqa: BLE001 - a token answering a non-standard shape (e.g. bytes32 symbol) is unknown
+            out[(address, field)] = None
+    return out
+
+
+def usd_prices(chain_id: int | None, tokens: list[str]) -> dict[str, float]:
+    """DefiLlama's current USD price per whole token, keyed by lower-cased address; {} when unavailable."""
+    chain = PRICE_CHAINS.get(chain_id or 0)
+    if not chain or not tokens:
+        return {}
+    coins = ",".join(f"{chain}:{t}" for t in sorted({t.lower() for t in tokens}))
+    try:
+        resp = requests.get(PRICES_URL.format(coins=coins), timeout=TIMEOUT_SECONDS, headers={"User-Agent": "batchers-cli"})
+        resp.raise_for_status()
+        answer = resp.json()["coins"]
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        log.warning("no USD prices from DefiLlama (%s)", type(exc).__name__)
+        return {}
+    return {key.split(":", 1)[1].lower(): float(value["price"]) for key, value in answer.items()}
+
+
+def read_tokens(rpc: Rpc, chain_id: int | None, wrappers: list[str]) -> dict[str, dict[str, Any]]:
+    """Per input wrapper: its underlying token's address, symbol and decimals, the wrapper `rate`, and `priceUsd`.
+
+    `priceUsd` is per whole underlying token: DefiLlama's, or for an ERC-4626 share `convertToAssets` × the asset's.
+    """
+    wrappers = sorted(set(wrappers))
+    w = read_fields(rpc, [
+        c for t in wrappers for c in (
+            (t, "underlying", "underlying()", (), ["address"]),
+            (t, "rate", "rate()", (), ["uint256"]),
+        )
+    ])
+    underlyings = sorted({w[(t, "underlying")] for t in wrappers if w[(t, "underlying")]})
+    u = read_fields(rpc, [
+        c for t in underlyings for c in (
+            (t, "symbol", "symbol()", (), ["string"]),
+            (t, "decimals", "decimals()", (), ["uint8"]),
+            (t, "asset", "asset()", (), ["address"]),
+        )
+    ])
+    shares = [t for t in underlyings if u[(t, "asset")] and u[(t, "decimals")] is not None]
+    v = read_fields(rpc, [
+        c for t in shares for c in (
+            (t, "perShare", "convertToAssets(uint256)", (10 ** u[(t, "decimals")],), ["uint256"]),
+            (u[(t, "asset")], "decimals", "decimals()", (), ["uint8"]),
+        )
+    ])
+    prices = usd_prices(chain_id, [u[(t, "asset")] if t in shares else t for t in underlyings])
+
+    def price_of(token: str) -> float | None:
+        if token not in shares:
+            return prices.get(token.lower())
+        asset = u[(token, "asset")]
+        per_share, asset_decimals, asset_price = v[(token, "perShare")], v[(asset, "decimals")], prices.get(asset.lower())
+        if per_share is None or asset_decimals is None or asset_price is None:
+            return None
+        return float(Decimal(per_share).scaleb(-asset_decimals)) * asset_price
+
+    out = {}
+    for t in wrappers:
+        underlying = w[(t, "underlying")]
+        out[t] = {
+            "address": underlying,
+            "symbol": u.get((underlying, "symbol")),
+            "decimals": u.get((underlying, "decimals")),
+            "rate": w[(t, "rate")],
+            "priceUsd": price_of(underlying) if underlying else None,
+        }
+    return out
 
 
 # ---------------------------------------------------------------- normalize
@@ -450,29 +528,65 @@ def waiting_on(state: dict[str, Any], now: int) -> str:
     return "due"
 
 
-def amount(raw: int | None, decimals: int | None) -> str | None:
-    """`raw` token units in whole tokens, e.g. `1234.5`; raw units when decimals are unknown."""
+def amount(raw: int | None, token: dict[str, Any] | None) -> str | None:
+    """`raw` wrapper units as whole underlying tokens (`raw × rate / 10^decimals`), e.g. `1234.5`.
+
+    Raw wrapper units when the underlying is unknown.
+    """
     if raw is None:
         return None
-    if decimals is None:
+    if not token or token.get("decimals") is None or token.get("rate") is None:
         return str(raw)
-    text = f"{Decimal(raw).scaleb(-decimals):f}"
+    text = f"{Decimal(raw * token['rate']).scaleb(-token['decimals']):f}"
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def unshielded_of(batch: dict[str, Any] | None, decimals: int | None) -> str | None:
-    """A batch's unshielded amount in whole tokens, `?` when the node refused its logs."""
+def unshielded_of(batch: dict[str, Any] | None, token: dict[str, Any] | None) -> str | None:
+    """A batch's unshielded amount in whole underlying tokens, `?` when the node refused its logs."""
     if not batch:
         return None
-    return "?" if batch.get("unshieldedUnknown") else amount(batch.get("unshielded"), decimals)
+    return "?" if batch.get("unshieldedUnknown") else amount(batch.get("unshielded"), token)
+
+
+def usd_of(whole: str | None, token: dict[str, Any] | None) -> float | None:
+    """The USD value of `whole` underlying tokens at the current price, to the cent."""
+    if whole in (None, "?") or not token or token.get("priceUsd") is None or token.get("decimals") is None:
+        return None
+    return round(float(Decimal(whole)) * token["priceUsd"], 2)
+
+
+def units(whole: str | None, token: dict[str, Any] | None) -> str:
+    """`1,602,071.31 USDT`: thousands separators, cents above one token, up to 6 decimals below."""
+    if whole in (None, "?"):
+        return whole or "-"
+    value = Decimal(whole)
+    if value == 0:
+        text = "0"
+    elif abs(value) >= 1:
+        text = f"{value:,.2f}"
+    else:
+        text = f"{value:,.6f}".rstrip("0").rstrip(".")
+    symbol = (token or {}).get("symbol")
+    return f"{text} {symbol}" if symbol else text
+
+
+def dollars(value: float | None) -> str:
+    """`$1,600,382.17`, or `-`."""
+    return "-" if value is None else f"${value:,.2f}"
+
+
+def unshielded_text(whole: str | None, usd: float | None, token: dict[str, Any] | None) -> str:
+    """`1,602,071.31 USDT ($1,600,382.17)` for the text line."""
+    return units(whole, token) + (f" ({dollars(usd)})" if usd is not None else "")
 
 
 def normalize(
-    entry: dict[str, str], state: dict[str, Any], labels: dict[str, str], now: int, decimals: dict[str, int | None]
+    entry: dict[str, str], state: dict[str, Any], labels: dict[str, str], now: int, tokens: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
     """One batcher record for --json and the text line."""
     current, previous = state["current"], state["previous"]
-    token_decimals = decimals.get(state["fromToken"]) if state["fromToken"] else None
+    token = tokens.get(state["fromToken"]) if state["fromToken"] else None
+    previous_unshielded = unshielded_of(previous, token)
     record = {
         "vault": entry["vault"],
         "side": entry["side"],
@@ -488,10 +602,13 @@ def normalize(
         "previousBatchId": previous["id"] if previous else None,
         "previousState": previous["state"] if previous else None,
         "previousDispatchedAt": iso(previous["dispatchedAt"]) if previous else None,
-        "previousUnshielded": unshielded_of(previous, token_decimals),
+        "previousUnshielded": previous_unshielded,
+        "previousUnshieldedUsd": usd_of(previous_unshielded, token),
         "previousUnshieldedRaw": previous.get("unshielded") if previous else None,
         "fromToken": state["fromToken"],
-        "fromTokenDecimals": token_decimals,
+        "unshieldedToken": (
+            {k: token[k] for k in ("address", "symbol", "decimals", "priceUsd")} if token else None
+        ),
     }
     record["waiting"] = waiting_on(
         {**state, "nextDispatchAt": current["createdAt"] + current["minAge"]}, now
@@ -542,7 +659,7 @@ def format_line(record: dict[str, Any], now: int) -> str:
     owner = record["ownerLabel"] or record["owner"]
     previous = (
         f"prev #{record['previousBatchId']} {record['previousState']} {short_time(record['previousDispatchedAt'])}"
-        f" unshielded {record['previousUnshielded'] or '-'}"
+        f" unshielded {unshielded_text(record['previousUnshielded'], record['previousUnshieldedUsd'], record['unshieldedToken'])}"
         if record["previousBatchId"]
         else "prev -"
     )
@@ -617,12 +734,13 @@ def render_schedule(records: list[dict[str, Any]], chain_id: int | None, now: in
                 age,
                 age if r["minBatchAge"] == r["batchMinBatchAge"] else f"[yellow]{duration(r['minBatchAge'])}[/yellow]",
                 previous,
-                r["previousUnshielded"] or "-",
+                units(r["previousUnshielded"], r["unshieldedToken"]),
+                dollars(r["previousUnshieldedUsd"]),
                 linked(r["owner"], chain_id, r["ownerLabel"]),
                 linked(r["address"], chain_id),
             ])
-        columns = ["Side", "Batch", "Waiting", "Next (UTC)", "When", "Age", "Policy", "Previous", "Unshielded", "Owner", "Batcher"]
-        table = table_of(f"[bold]{vault}[/bold]", columns, rows, {"Batch", "Age", "Policy", "Unshielded"})
+        columns = ["Side", "Batch", "Waiting", "Next (UTC)", "When", "Age", "Policy", "Previous", "Unshielded", "USD", "Owner", "Batcher"]
+        table = table_of(f"[bold]{vault}[/bold]", columns, rows, {"Batch", "Age", "Policy", "Unshielded", "USD"})
         console.print(table, crop=False)
         console.print()
 
@@ -645,11 +763,12 @@ def render_batchers(records: list[dict[str, Any]], chain_id: int | None, now: in
                 duration(b["minBatchAge"]),
                 short_time(b["dispatchedAt"]).removesuffix(" UTC"),
                 duration(b["callbackDeadline"]),
-                b["unshielded"] or "-",
+                units(b["unshielded"], r["unshieldedToken"]),
+                dollars(b["unshieldedUsd"]),
             ])
-        columns = ["Batch", "State", "Created (UTC)", "Age", "Dispatched (UTC)", "Callback deadline", "Unshielded"]
+        columns = ["Batch", "State", "Created (UTC)", "Age", "Dispatched (UTC)", "Callback deadline", "Unshielded", "USD"]
         console.print(title)
-        console.print(table_of("", columns, rows, {"Batch", "Age", "Callback deadline", "Unshielded"}), crop=False)
+        console.print(table_of("", columns, rows, {"Batch", "Age", "Callback deadline", "Unshielded", "USD"}), crop=False)
         console.print()
 
 
@@ -763,8 +882,8 @@ def schedule(
         return
     now = int(time.time())
     names = labels()
-    decimals = read_decimals(rpc, [s["fromToken"] for s in states if s["fromToken"]])
-    records = [normalize(e, s, names, now, decimals) for e, s in zip(entries, states, strict=True)]
+    tokens = read_tokens(rpc, book.get("chainId"), [s["fromToken"] for s in states if s["fromToken"]])
+    records = [normalize(e, s, names, now, tokens) for e, s in zip(entries, states, strict=True)]
     if waiting:
         records = [r for r in records if r["waiting"] == waiting]
     records.sort(key=lambda r: (r["nextDispatchAt"] or "", r["vault"], r["side"]))
@@ -821,11 +940,11 @@ def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bo
             s["previous"] = batches[(s["address"], s["previous"]["id"])]
     now = int(time.time())
     names = labels()
-    decimals = read_decimals(rpc, [s["fromToken"] for s in states if s["fromToken"]])
+    tokens = read_tokens(rpc, book.get("chainId"), [s["fromToken"] for s in states if s["fromToken"]])
     records = []
     for entry, state in zip(entries, states, strict=True):
-        record = normalize(entry, state, names, now, decimals)
-        token_decimals = record["fromTokenDecimals"]
+        record = normalize(entry, state, names, now, tokens)
+        token = tokens.get(state["fromToken"]) if state["fromToken"] else None
         record["batches"] = [
             {
                 "id": b["id"],
@@ -835,7 +954,8 @@ def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bo
                 "dispatchedAt": iso(b["dispatchedAt"]),
                 "callbackDeadline": b["callbackDeadline"],
                 "unwrapRequestId": b["unwrapRequestId"],
-                "unshielded": unshielded_of(b, token_decimals),
+                "unshielded": unshielded_of(b, token),
+                "unshieldedUsd": usd_of(unshielded_of(b, token), token),
                 "unshieldedRaw": b["unshielded"],
             }
             for b in (batches[(state["address"], i)] for i in range(state["currentBatchId"], max(0, state["currentBatchId"] - history), -1))
@@ -853,7 +973,7 @@ def batcher(ctx: click.Context, refs: tuple[str, ...], history: int, as_json: bo
             click.echo(
                 f"  #{b['id']} {b['state']}  created {short_time(b['createdAt'])}  age {duration(b['minBatchAge'])}"
                 f"  dispatched {short_time(b['dispatchedAt'])}  callback deadline {duration(b['callbackDeadline'])}"
-                f"  unshielded {b['unshielded'] or '-'}"
+                f"  unshielded {unshielded_text(b['unshielded'], b['unshieldedUsd'], record['unshieldedToken'])}"
             )
 
 

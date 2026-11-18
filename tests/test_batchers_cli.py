@@ -35,7 +35,21 @@ DEPOSIT = "0x0000000000000000000000000000000000001234"
 REDEEM_0 = "0x0000000000000000000000000000000000001235"
 REDEEM_1 = "0x0000000000000000000000000000000000001236"
 OWNER = "0x0000000000000000000000000000000000000abc"
+# Deposit batchers take TOKEN (wraps USDC 1:1); redeem batchers take SHARE_TOKEN (wraps an ERC-4626 share of USDC).
 TOKEN = "0x0000000000000000000000000000000000000c0c"
+USDC = "0x0000000000000000000000000000000000000dc0"
+SHARE_TOKEN = "0x0000000000000000000000000000000000000c5a"
+SHARE = "0x0000000000000000000000000000000000000da5"
+# USDC per whole share, in USDC units; and DefiLlama's USD price of USDC.
+USDC_PER_SHARE = 1_050_000
+USDC_PRICE = 2.0
+TOKENS = {
+    TOKEN: {"underlying()": (["address"], USDC), "rate()": (["uint256"], 1)},
+    SHARE_TOKEN: {"underlying()": (["address"], SHARE), "rate()": (["uint256"], 10**12)},
+    USDC: {"symbol()": (["string"], "USDC"), "decimals()": (["uint8"], 6)},
+    SHARE: {"symbol()": (["string"], "vUSDC"), "decimals()": (["uint8"], 18), "asset()": (["address"], USDC),
+            "convertToAssets(uint256)": (["uint256"], USDC_PER_SHARE)},
+}
 LATEST_BLOCK = 1_000_000
 # Unwrap request ids, and the cleartext each finalized unwrap logged on TOKEN.
 FINALIZED_UNWRAP = "0x" + "aa" * 32
@@ -51,18 +65,21 @@ def selector(signature: str) -> str:
 CHAIN = {
     DEPOSIT: {
         "paused": False,
+        "fromToken": TOKEN,
         "currentBatchId": 5,
         "minBatchAge": 86280,
         "batches": {5: (0, NOW - 2000, 0, 1800, 43200, 0), 4: (2, NOW - 5000, NOW - 1000, 1800, 43200, FINALIZED_UNWRAP)},
     },
     REDEEM_0: {
         "paused": False,
+        "fromToken": SHARE_TOKEN,
         "currentBatchId": 3,
         "minBatchAge": 1800,
         "batches": {3: (0, NOW - 4000, 0, 1800, 43200, 0), 2: (1, NOW - 9000, NOW - 4000, 1800, 43200, INFLIGHT_UNWRAP)},
     },
     REDEEM_1: {
         "paused": True,
+        "fromToken": SHARE_TOKEN,
         "currentBatchId": 1,
         "minBatchAge": 1,
         "batches": {1: (0, NOW - 100, 0, 1, 43200, 0)},
@@ -70,18 +87,21 @@ CHAIN = {
 }
 
 
-def answer(to: str, data: str) -> str:
-    """The ABI-encoded return of `data` on the stub batcher `to`, or on TOKEN."""
+def answer(to: str, data: str) -> str | None:
+    """The ABI-encoded return of `data` on the stub batcher or token `to`; None for a revert."""
     sel, args = data[2:10], bytes.fromhex(data[10:])
-    if to.lower() == TOKEN and sel == selector("decimals()"):
-        return "0x" + encode(["uint8"], [6]).hex()
+    if to.lower() in TOKENS:
+        for signature, (types, value) in TOKENS[to.lower()].items():
+            if sel == selector(signature):
+                return "0x" + encode(types, [value]).hex()
+        return None
     batcher = CHAIN[to]
     own = {
         selector("paused()"): (["bool"], batcher["paused"]),
         selector("owner()"): (["address"], OWNER),
         selector("minBatchAge()"): (["uint256"], batcher["minBatchAge"]),
         selector("currentBatchId()"): (["uint256"], batcher["currentBatchId"]),
-        selector("fromToken()"): (["address"], TOKEN),
+        selector("fromToken()"): (["address"], batcher["fromToken"]),
     }
     if sel in own:
         types, value = own[sel]
@@ -106,6 +126,10 @@ class StubResponse:
     def json(self):
         return self.body
 
+    def raise_for_status(self) -> None:
+        if not self.ok:
+            raise bc.requests.HTTPError(str(self.status_code))
+
 
 def unwrap_logs(query: dict) -> list[dict]:
     """The UnwrapFinalized logs of TOKEN matching `query`'s request ids."""
@@ -115,6 +139,12 @@ def unwrap_logs(query: dict) -> list[dict]:
         for rid, value in UNWRAPPED.items()
         if query["address"].lower() == TOKEN and rid in ids
     ]
+
+
+def stub_prices(url: str, timeout: float, headers: dict) -> StubResponse:
+    """DefiLlama's current-price answer: USDC only."""
+    coins = url.rsplit("/", 1)[1].split(",")
+    return StubResponse({"coins": {c: {"price": USDC_PRICE, "symbol": "USDC"} for c in coins if c == f"ethereum:{USDC}"}})
 
 
 class StubSession:
@@ -147,7 +177,11 @@ class StubSession:
                     out.append({"id": call["id"], "result": unwrap_logs(query)})
             else:
                 params = call["params"][0]
-                out.append({"id": call["id"], "result": answer(params["to"], params["data"])})
+                result = answer(params["to"], params["data"])
+                if result is None:
+                    out.append({"id": call["id"], "error": {"code": 3, "message": "execution reverted"}})
+                else:
+                    out.append({"id": call["id"], "result": result})
         return StubResponse(out)
 
 
@@ -168,6 +202,7 @@ def chain(monkeypatch: pytest.MonkeyPatch) -> StubSession:
     monkeypatch.setattr(bc.Rpc, "__init__", lambda self, url, session_=None: original(self, url, session))
     monkeypatch.setattr(bc.time, "time", lambda: NOW)
     monkeypatch.setattr(bc.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(bc.requests, "get", stub_prices)
     monkeypatch.setenv("BATCHERS_CLI_CONFIG", "/nonexistent")
     return session
 
@@ -299,12 +334,60 @@ def test_batcher_history_reports_each_batch_unshielded(book, chain):
 
 def test_batcher_pretty_shows_unshielded_column(book, chain):
     result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "batcher", "curator-usdc/deposit", "--history", "2", "--pretty"])
-    assert "12.5" in result.output
+    assert "$25.00" in result.output
 
 
-@pytest.mark.parametrize(("raw", "decimals", "text"), [(12_500_000, 6, "12.5"), (50_000_000_000, 6, "50000"), (0, 6, "0"), (7, None, "7")])
-def test_amount_in_whole_tokens(raw, decimals, text):
-    assert bc.amount(raw, decimals) == text
+@pytest.mark.parametrize(
+    ("raw", "token", "text"),
+    [
+        (12_500_000, {"decimals": 6, "rate": 1}, "12.5"),
+        (50_000_000_000, {"decimals": 6, "rate": 1}, "50000"),
+        (507_777, {"decimals": 8, "rate": 100}, "0.507777"),
+        (1_500_000, {"decimals": 18, "rate": 10**12}, "1.5"),
+        (0, {"decimals": 6, "rate": 1}, "0"),
+        (7, None, "7"),
+    ],
+)
+def test_amount_in_whole_underlying_tokens(raw, token, text):
+    assert bc.amount(raw, token) == text
+
+
+@pytest.mark.parametrize(
+    ("whole", "text"),
+    [("1602071.312643", "1,602,071.31 USDT"), ("0.507777", "0.507777 USDT"), ("0", "0 USDT"), ("?", "?"), (None, "-")],
+)
+def test_units_formats_with_separators_and_symbol(whole, text):
+    assert bc.units(whole, {"symbol": "USDT"}) == text
+
+
+@pytest.mark.parametrize(("value", "text"), [(1600382.171, "$1,600,382.17"), (0.0, "$0.00"), (None, "-")])
+def test_dollars(value, text):
+    assert bc.dollars(value) == text
+
+
+def test_previous_unshielded_usd_is_amount_times_price(book, chain):
+    assert by_side(schedule(book))["deposit"]["previousUnshieldedUsd"] == 25.0
+
+
+def test_unshielded_token_is_the_underlying(book, chain):
+    assert by_side(schedule(book))["deposit"]["unshieldedToken"]["symbol"] == "USDC"
+
+
+def test_erc4626_share_priced_through_its_asset(book, chain):
+    assert by_side(schedule(book))["redeem-0"]["unshieldedToken"]["priceUsd"] == pytest.approx(1.05 * USDC_PRICE)
+
+
+def test_text_line_shows_units_and_dollars(book, chain):
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "schedule", "--vault", "curator-usdc", "--side", "deposit"])
+    assert "unshielded 12.50 USDC ($25.00)" in result.output
+
+
+def test_prices_unavailable_leave_usd_empty(book, chain, monkeypatch):
+    def down(*_args, **_kwargs):
+        raise bc.requests.ConnectionError
+
+    monkeypatch.setattr(bc.requests, "get", down)
+    assert by_side(schedule(book))["deposit"]["previousUnshieldedUsd"] is None
 
 
 @pytest.mark.parametrize(("side", "order"), [("deposit", (0, 0)), ("redeem-10", (1, 10))])

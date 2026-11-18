@@ -59,9 +59,13 @@ user's GitHub login. Configure it once in `~/.config/batchers-cli/config.json`
 - `--json`: normalized records: ISO UTC times, seconds, batch state names,
   `waiting` as `paused | previous-batch | age | due`. Unshielded amounts:
   `previousUnshielded` (`schedule`) and `batches[].unshielded` (`batcher`) in
-  whole input tokens as a string, `…UnshieldedRaw` in token units; `null` while
-  the unwrap is not finalized, `"?"` only when the node refused the logs
-  (pruned history). Rate-limited calls are retried, never reported missing.
+  whole underlying tokens as an exact decimal string, `…UnshieldedUsd` in USD
+  (a number, to the cent), `…UnshieldedRaw` in wrapper units; `null` while the
+  unwrap is not finalized, `"?"` only when the node refused the logs (pruned
+  history). `unshieldedToken` names the unit: `{address, symbol, decimals,
+  priceUsd}`. Rate-limited calls are retried, never reported missing.
+- Text and `--pretty` print amounts as `1,602,071.31 USDT ($1,600,382.17)`:
+  thousands separators, cents above one token, up to 6 decimals below.
 - `--raw` (`schedule` only): the decoded getter results per batcher.
 - `--pretty`: for a human at a terminal: a table per vault (`schedule`) or
   per batcher with its batches (`batcher`), coloured `waiting` and state, short
@@ -116,6 +120,13 @@ batchers --network sepolia schedule
   wrapper's `UnwrapFinalized` log for the batch's `unwrapRequestId`, so it
   appears once the unwrap is finalized, which can precede the route
   (`Dispatched` with an amount). `0` is an empty batch.
+- The unit is the input wrapper's underlying: the asset (USDC, WBTC…) for a
+  deposit batcher, the vault share (steakUSDT…) for a redeem one.
+- USD is at the **current** price, not the price at dispatch: DefiLlama's
+  price of the underlying, or for an ERC-4626 share `convertToAssets(1 share)`
+  on chain times DefiLlama's price of its asset. A token DefiLlama does not
+  price, and every token on sepolia, has no USD (`-`). DefiLlama is called
+  with token addresses only, no key.
 - publicnode serves logs only for its last ~10k blocks (~1.5 days); older
   batches print `unshielded ?` with one warning. Pass an archive `--rpc-url`
   (or `rpc.<network>`) for older history.
