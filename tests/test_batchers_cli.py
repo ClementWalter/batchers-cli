@@ -118,17 +118,24 @@ def unwrap_logs(query: dict) -> list[dict]:
 
 
 class StubSession:
-    """A JSON-RPC node over CHAIN; `chain_id` is what eth_chainId answers, logs before `pruned_before` are refused."""
+    """A JSON-RPC node over CHAIN; `chain_id` is what eth_chainId answers, logs before `pruned_before` are refused.
+
+    The first `rate_limited[method]` calls of a method answer QuickNode's per-call rate-limit error.
+    """
 
     def __init__(self, chain_id: int = 1):
         self.headers: dict[str, str] = {}
         self.chain_id = chain_id
         self.pruned_before = 0
+        self.rate_limited: dict[str, int] = {}
 
     def post(self, _url, json, timeout):  # noqa: A002 - mirrors requests' keyword
         out = []
         for call in json:
-            if call["method"] == "eth_chainId":
+            if self.rate_limited.get(call["method"], 0) > 0:
+                self.rate_limited[call["method"]] -= 1
+                out.append({"id": call["id"], "error": {"code": -32007, "message": "500/second request limit reached"}})
+            elif call["method"] == "eth_chainId":
                 out.append({"id": call["id"], "result": hex(self.chain_id)})
             elif call["method"] == "eth_getBlockByNumber":
                 out.append({"id": call["id"], "result": {"number": hex(LATEST_BLOCK), "timestamp": hex(NOW)}})
@@ -160,6 +167,7 @@ def chain(monkeypatch: pytest.MonkeyPatch) -> StubSession:
     original = bc.Rpc.__init__
     monkeypatch.setattr(bc.Rpc, "__init__", lambda self, url, session_=None: original(self, url, session))
     monkeypatch.setattr(bc.time, "time", lambda: NOW)
+    monkeypatch.setattr(bc.time, "sleep", lambda _seconds: None)
     monkeypatch.setenv("BATCHERS_CLI_CONFIG", "/nonexistent")
     return session
 
@@ -266,6 +274,22 @@ def test_unwrap_not_finalized_has_no_unshielded(book, chain):
 def test_pruned_logs_leave_unshielded_unknown(book, chain):
     chain.pruned_before = LATEST_BLOCK
     assert by_side(schedule(book))["deposit"]["previousUnshielded"] == "?"
+
+
+def test_rate_limited_logs_are_retried_not_unknown(book, chain):
+    chain.rate_limited = {"eth_getLogs": 1}
+    assert by_side(schedule(book))["deposit"]["previousUnshielded"] == "12.5"
+
+
+def test_rate_limited_calls_are_retried(book, chain):
+    chain.rate_limited = {"eth_call": 5}
+    assert by_side(schedule(book))["deposit"]["waiting"] == "due"
+
+
+def test_persistent_rate_limit_is_an_error(book, chain):
+    chain.rate_limited = {"eth_getLogs": 1000}
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "schedule"])
+    assert "rate-limited" in result.output
 
 
 def test_batcher_history_reports_each_batch_unshielded(book, chain):

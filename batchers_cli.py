@@ -217,6 +217,14 @@ def retry_after(header: str | None, default: float) -> float:
         return default
 
 
+def rate_limited(error: dict[str, Any] | None) -> bool:
+    """Whether a per-call JSON-RPC error is a rate limit (QuickNode -32007, the -32005 convention)."""
+    if not error:
+        return False
+    message = str(error.get("message", "")).lower()
+    return error.get("code") in (-32005, -32007, 429) or "rate limit" in message or "request limit" in message
+
+
 class Rpc:
     """JSON-RPC over one session: batched `eth_call`s, bounded retries on 429/5xx."""
 
@@ -257,19 +265,37 @@ class Rpc:
             return answer
         raise AssertionError("unreachable")
 
-    def batch(self, method: str, params: list[list[Any]]) -> list[Any]:
-        """`method` with each params, in batches; an error answers None."""
-        results: list[Any] = []
-        for start in range(0, len(params), CALLS_PER_REQUEST):
-            chunk = params[start : start + CALLS_PER_REQUEST]
-            payload = [{"jsonrpc": "2.0", "id": i, "method": method, "params": p} for i, p in enumerate(chunk)]
-            by_id = {item["id"]: item for item in self.post(payload)}
-            for i in range(len(chunk)):
-                item = by_id.get(i, {})
-                if "error" in item:
-                    log.debug("%s %s: %s", method, chunk[i], item["error"])
-                results.append(item.get("result") if "error" not in item else None)
-        return results
+    def batch(self, method: str, params: list[list[Any]], errors: dict[int, str] | None = None) -> list[Any]:
+        """`method` with each params, in batches; a call the node refuses answers None, its message in `errors`.
+
+        Rate-limited calls are retried, never answered None: a None must mean the node refused that call.
+        """
+        results: list[Any] = [None] * len(params)
+        todo = list(range(len(params)))
+        for attempt in range(1, RETRIES + 2):
+            limited = []
+            for start in range(0, len(todo), CALLS_PER_REQUEST):
+                chunk = todo[start : start + CALLS_PER_REQUEST]
+                payload = [{"jsonrpc": "2.0", "id": i, "method": method, "params": params[i]} for i in chunk]
+                by_id = {item.get("id"): item for item in self.post(payload)}
+                for i in chunk:
+                    item = by_id.get(i)
+                    if item is None or rate_limited(item.get("error")):
+                        limited.append(i)
+                    elif "error" in item:
+                        log.debug("%s %s: %s", method, params[i], item["error"])
+                        if errors is not None:
+                            errors[i] = str(item["error"].get("message", item["error"]))
+                    else:
+                        results[i] = item.get("result")
+            if not limited:
+                return results
+            if attempt > RETRIES:
+                raise click.ClickException(f"RPC rate-limited {len(limited)} {method} call(s) after {RETRIES} retries; retry later")
+            log.info("RPC rate-limited %d %s call(s), retrying in %ss", len(limited), method, 2**attempt)
+            time.sleep(2**attempt)
+            todo = limited
+        raise AssertionError("unreachable")
 
     def call_many(self, calls: list[tuple[str, str]]) -> list[str | None]:
         """`eth_call` each (to, data) at latest; a revert answers None."""
@@ -373,7 +399,8 @@ def read_unshielded(rpc: Rpc, batches: dict[tuple[str, int], dict[str, Any]], fr
             end = min(start + LOG_BLOCKS - 1, latest)
             filters.append((token, start, end, {"address": token, "fromBlock": hex(start), "toBlock": hex(end),
                                                 "topics": [UNWRAP_FINALIZED, None, ids]}))
-    answers = rpc.batch("eth_getLogs", [[f] for *_, f in filters])
+    reasons: dict[int, str] = {}
+    answers = rpc.batch("eth_getLogs", [[f] for *_, f in filters], reasons)
     found: dict[tuple[str, str], int] = {}
     refused: dict[str, int] = {}
     for (token, _, end, _), logs in zip(filters, answers, strict=True):
@@ -389,7 +416,11 @@ def read_unshielded(rpc: Rpc, batches: dict[tuple[str, int], dict[str, Any]], fr
         batch["unshieldedUnknown"] = amount is None and block_at(batch["dispatchedAt"]) <= refused.get(token, -1)
     unknown = sum(b["unshieldedUnknown"] for _, b in wanted)
     if unknown:
-        log.warning("the RPC refused old logs: %d batch(es) unshielded unknown; pass an archive --rpc-url", unknown)
+        log.warning(
+            "the RPC refused logs (%s): %d batch(es) unshielded unknown; pass an archive --rpc-url",
+            next(iter(reasons.values()), "no reason"),
+            unknown,
+        )
 
 
 def read_decimals(rpc: Rpc, tokens: list[str]) -> dict[str, int | None]:

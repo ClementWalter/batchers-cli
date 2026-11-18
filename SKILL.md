@@ -60,7 +60,8 @@ user's GitHub login. Configure it once in `~/.config/batchers-cli/config.json`
   `waiting` as `paused | previous-batch | age | due`. Unshielded amounts:
   `previousUnshielded` (`schedule`) and `batches[].unshielded` (`batcher`) in
   whole input tokens as a string, `…UnshieldedRaw` in token units; `null` while
-  the unwrap is not finalized, `"?"` when the node refused the logs.
+  the unwrap is not finalized, `"?"` only when the node refused the logs
+  (pruned history). Rate-limited calls are retried, never reported missing.
 - `--raw` (`schedule` only): the decoded getter results per batcher.
 - `--pretty`: for a human at a terminal: a table per vault (`schedule`) or
   per batcher with its batches (`batcher`), coloured `waiting` and state, short
