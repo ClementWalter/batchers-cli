@@ -5,13 +5,13 @@ description: >-
   bundled `batchers` command. For every vault in an address book it lists the
   deposit batcher and each redeem batcher of the rotation: current batch, min
   batch age (policy and pinned), next dispatch time in UTC, the previous
-  batch's state, the owner, and what the batch waits on (paused, previous
-  batch in flight, age, or due). `batcher` shows one batcher with its last
-  batches. Read-only. Every read supports --json, and `schedule` and `batcher`
+  batch's state and the amount it unshielded, the owner, and what the batch
+  waits on (paused, previous batch in flight, age, or due). `batcher` shows
+  one batcher with its last batches and what each unshielded. Read-only. Every read supports --json, and `schedule` and `batcher`
   a --pretty table. Triggers - "batcher status",
   "when does this vault dispatch", "next dispatch", "redeem batchers
   schedule", "is a batch in flight", "which batchers are paused", "warm-up
-  batchers", "batchers cli".
+  batchers", "how much did this batch unshield", "batchers cli".
 allowed-tools:
   - Bash
   - Read
@@ -57,7 +57,10 @@ user's GitHub login. Configure it once in `~/.config/batchers-cli/config.json`
 - Default: one line per batcher, the full batcher address tab-separated last.
   Times are UTC, durations like `23h58m`.
 - `--json`: normalized records: ISO UTC times, seconds, batch state names,
-  `waiting` as `paused | previous-batch | age | due`.
+  `waiting` as `paused | previous-batch | age | due`. Unshielded amounts:
+  `previousUnshielded` (`schedule`) and `batches[].unshielded` (`batcher`) in
+  whole input tokens as a string, `…UnshieldedRaw` in token units; `null` while
+  the unwrap is not finalized, `"?"` when the node refused the logs.
 - `--raw` (`schedule` only): the decoded getter results per batcher.
 - `--pretty`: for a human at a terminal: a table per vault (`schedule`) or
   per batcher with its batches (`batcher`), coloured `waiting` and state, short
@@ -92,6 +95,8 @@ batchers --network sepolia schedule
 - **Which batchers has the launch not handed over yet?** Label the deployer in
   `labels`, then `batchers schedule | grep 'owner deployer'`.
 - **A batcher's recent history:** `batchers batcher <vault>/<side> --history 10`.
+- **How much did each deposit batch unshield today?**
+  `batchers schedule --side deposit --json | jq -r '.[] | [.vault, .previousBatchId, .previousUnshielded] | @tsv'`
 
 ## Gotchas
 
@@ -104,6 +109,15 @@ batchers --network sepolia schedule
 - Batch 1 is the genesis batch and has no previous one. An empty batch the
   keeper dispatched is `Canceled`, which is normal.
 - `callback deadline` in `batcher` is a duration after dispatch, not a time.
+- `unshielded` is the cleartext of the batch's unwrap, in the input token
+  (`fromToken`: the confidential asset for a deposit batcher, the confidential
+  share for a redeem one). No getter stores it: it comes from the input
+  wrapper's `UnwrapFinalized` log for the batch's `unwrapRequestId`, so it
+  appears once the unwrap is finalized, which can precede the route
+  (`Dispatched` with an amount). `0` is an empty batch.
+- publicnode serves logs only for its last ~10k blocks (~1.5 days); older
+  batches print `unshielded ?` with one warning. Pass an archive `--rpc-url`
+  (or `rpc.<network>`) for older history.
 - Measured 2026-11-17: a full mainnet `schedule` (48 batchers, about 720
   `eth_call`s in batches of 40) hits publicnode's 429 a few times and finishes
   in about 20 s through the retries. Set `rpc.<network>` to a keyed node for

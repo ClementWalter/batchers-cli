@@ -35,54 +35,63 @@ DEPOSIT = "0x0000000000000000000000000000000000001234"
 REDEEM_0 = "0x0000000000000000000000000000000000001235"
 REDEEM_1 = "0x0000000000000000000000000000000000001236"
 OWNER = "0x0000000000000000000000000000000000000abc"
+TOKEN = "0x0000000000000000000000000000000000000c0c"
+LATEST_BLOCK = 1_000_000
+# Unwrap request ids, and the cleartext each finalized unwrap logged on TOKEN.
+FINALIZED_UNWRAP = "0x" + "aa" * 32
+INFLIGHT_UNWRAP = "0x" + "bb" * 32
+UNWRAPPED = {FINALIZED_UNWRAP: 12_500_000}
 
 
 def selector(signature: str) -> str:
     return function_signature_to_4byte_selector(signature).hex()
 
 
-# Per batcher: own fields, and per batch id (state, createdAt, dispatchedAt, minAge, callbackDeadline).
+# Per batcher: own fields, and per batch id (state, createdAt, dispatchedAt, minAge, callbackDeadline, unwrapRequestId).
 CHAIN = {
     DEPOSIT: {
         "paused": False,
         "currentBatchId": 5,
         "minBatchAge": 86280,
-        "batches": {5: (0, NOW - 2000, 0, 1800, 43200), 4: (2, NOW - 5000, NOW - 1000, 1800, 43200)},
+        "batches": {5: (0, NOW - 2000, 0, 1800, 43200, 0), 4: (2, NOW - 5000, NOW - 1000, 1800, 43200, FINALIZED_UNWRAP)},
     },
     REDEEM_0: {
         "paused": False,
         "currentBatchId": 3,
         "minBatchAge": 1800,
-        "batches": {3: (0, NOW - 4000, 0, 1800, 43200), 2: (1, NOW - 9000, NOW - 4000, 1800, 43200)},
+        "batches": {3: (0, NOW - 4000, 0, 1800, 43200, 0), 2: (1, NOW - 9000, NOW - 4000, 1800, 43200, INFLIGHT_UNWRAP)},
     },
     REDEEM_1: {
         "paused": True,
         "currentBatchId": 1,
         "minBatchAge": 1,
-        "batches": {1: (0, NOW - 100, 0, 1, 43200)},
+        "batches": {1: (0, NOW - 100, 0, 1, 43200, 0)},
     },
 }
 
 
 def answer(to: str, data: str) -> str:
-    """The ABI-encoded return of `data` on the stub batcher `to`."""
-    batcher = CHAIN[to]
+    """The ABI-encoded return of `data` on the stub batcher `to`, or on TOKEN."""
     sel, args = data[2:10], bytes.fromhex(data[10:])
+    if to.lower() == TOKEN and sel == selector("decimals()"):
+        return "0x" + encode(["uint8"], [6]).hex()
+    batcher = CHAIN[to]
     own = {
         selector("paused()"): (["bool"], batcher["paused"]),
         selector("owner()"): (["address"], OWNER),
         selector("minBatchAge()"): (["uint256"], batcher["minBatchAge"]),
         selector("currentBatchId()"): (["uint256"], batcher["currentBatchId"]),
+        selector("fromToken()"): (["address"], TOKEN),
     }
     if sel in own:
         types, value = own[sel]
         return "0x" + encode(types, [value]).hex()
     batch_id = decode(["uint256"], args)[0]
-    fields = dict(zip(["batchState", "batchCreatedAt", "batchDispatchedAt", "batchMinBatchAge", "batchCallbackDeadline"],
-                      batcher["batches"][batch_id], strict=True))
+    names = ["batchState", "batchCreatedAt", "batchDispatchedAt", "batchMinBatchAge", "batchCallbackDeadline", "unwrapRequestId"]
+    fields = dict(zip(names, batcher["batches"][batch_id], strict=True))
     for name, value in fields.items():
         if sel == selector(f"{name}(uint256)"):
-            return "0x" + encode(["uint256"], [value]).hex()
+            return "0x" + (value[2:] if isinstance(value, str) else encode(["uint256"], [value]).hex())
     raise AssertionError(f"unexpected call {data}")
 
 
@@ -98,18 +107,37 @@ class StubResponse:
         return self.body
 
 
+def unwrap_logs(query: dict) -> list[dict]:
+    """The UnwrapFinalized logs of TOKEN matching `query`'s request ids."""
+    ids = query["topics"][2]
+    return [
+        {"topics": [bc.UNWRAP_FINALIZED, "0x" + "00" * 32, rid], "data": "0x" + encode(["bytes32", "uint64"], [b"\0" * 32, value]).hex()}
+        for rid, value in UNWRAPPED.items()
+        if query["address"].lower() == TOKEN and rid in ids
+    ]
+
+
 class StubSession:
-    """A JSON-RPC node over CHAIN; `chain_id` is what eth_chainId answers."""
+    """A JSON-RPC node over CHAIN; `chain_id` is what eth_chainId answers, logs before `pruned_before` are refused."""
 
     def __init__(self, chain_id: int = 1):
         self.headers: dict[str, str] = {}
         self.chain_id = chain_id
+        self.pruned_before = 0
 
     def post(self, _url, json, timeout):  # noqa: A002 - mirrors requests' keyword
         out = []
         for call in json:
             if call["method"] == "eth_chainId":
                 out.append({"id": call["id"], "result": hex(self.chain_id)})
+            elif call["method"] == "eth_getBlockByNumber":
+                out.append({"id": call["id"], "result": {"number": hex(LATEST_BLOCK), "timestamp": hex(NOW)}})
+            elif call["method"] == "eth_getLogs":
+                query = call["params"][0]
+                if int(query["fromBlock"], 16) < self.pruned_before:
+                    out.append({"id": call["id"], "error": {"code": -32602, "message": "Archive requests require a personal token"}})
+                else:
+                    out.append({"id": call["id"], "result": unwrap_logs(query)})
             else:
                 params = call["params"][0]
                 out.append({"id": call["id"], "result": answer(params["to"], params["data"])})
@@ -225,6 +253,34 @@ def test_schedule_pretty_titles_each_vault(book, chain):
 def test_batcher_pretty_lists_its_batches(book, chain):
     result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "batcher", "curator-usdc/redeem-0", "--history", "2", "--pretty"])
     assert "Dispatched" in result.output
+
+
+def test_schedule_reports_previous_batch_unshielded(book, chain):
+    assert by_side(schedule(book))["deposit"]["previousUnshielded"] == "12.5"
+
+
+def test_unwrap_not_finalized_has_no_unshielded(book, chain):
+    assert by_side(schedule(book))["redeem-0"]["previousUnshielded"] is None
+
+
+def test_pruned_logs_leave_unshielded_unknown(book, chain):
+    chain.pruned_before = LATEST_BLOCK
+    assert by_side(schedule(book))["deposit"]["previousUnshielded"] == "?"
+
+
+def test_batcher_history_reports_each_batch_unshielded(book, chain):
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "batcher", "curator-usdc/deposit", "--history", "2", "--json"])
+    assert [b["unshielded"] for b in json.loads(result.output)[0]["batches"]] == [None, "12.5"]
+
+
+def test_batcher_pretty_shows_unshielded_column(book, chain):
+    result = CliRunner().invoke(bc.cli, ["--address-book", str(book), "batcher", "curator-usdc/deposit", "--history", "2", "--pretty"])
+    assert "12.5" in result.output
+
+
+@pytest.mark.parametrize(("raw", "decimals", "text"), [(12_500_000, 6, "12.5"), (50_000_000_000, 6, "50000"), (0, 6, "0"), (7, None, "7")])
+def test_amount_in_whole_tokens(raw, decimals, text):
+    assert bc.amount(raw, decimals) == text
 
 
 @pytest.mark.parametrize(("side", "order"), [("deposit", (0, 0)), ("redeem-10", (1, 10))])
